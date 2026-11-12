@@ -124,6 +124,62 @@ After a lock-up and power-cycle:
 The watcher's dead-hart verdict has been tested only with a stand-in on another machine, not yet on
 a hart that really died.
 
+### Errors
+Depending whether running on Bianbu or Fedora the errors that appear on the serial console will look a little different. This probably comes down to the difference in the kernel config where the lockup watchdogs are not enabled in Bianbu but are in Fedora.
+Bianbu config:
+```
+# grep -E 'LOCKUP_DETECTOR|RCU_CPU_STALL_TIMEOUT|CONFIG_HZ=' /boot/config-$(uname -r)
+CONFIG_HZ=250
+# CONFIG_SOFTLOCKUP_DETECTOR is not set
+CONFIG_HAVE_HARDLOCKUP_DETECTOR_BUDDY=y
+# CONFIG_HARDLOCKUP_DETECTOR is not set
+CONFIG_RCU_CPU_STALL_TIMEOUT=21
+```
+
+Fedora config:
+```
+# grep -E 'LOCKUP_DETECTOR|RCU_CPU_STALL_TIMEOUT|CONFIG_HZ=' /boot/config-$(uname -r)
+CONFIG_HZ=1000
+CONFIG_LOCKUP_DETECTOR=y
+CONFIG_SOFTLOCKUP_DETECTOR=y
+CONFIG_SOFTLOCKUP_DETECTOR_INTR_STORM=y
+CONFIG_HAVE_HARDLOCKUP_DETECTOR_BUDDY=y
+CONFIG_HARDLOCKUP_DETECTOR=y
+# CONFIG_HARDLOCKUP_DETECTOR_PERF is not set
+CONFIG_HARDLOCKUP_DETECTOR_BUDDY=y
+# CONFIG_HARDLOCKUP_DETECTOR_ARCH is not set
+CONFIG_HARDLOCKUP_DETECTOR_COUNTS_HRTIMER=y
+CONFIG_RCU_CPU_STALL_TIMEOUT=60
+```
+
+Bianbu serial console errors:
+```
+[  681.004745] rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:
+[  681.008258] rcu:     (detected by 4, t=5252 jiffies, g=12501, q=3207 ncpus=16)
+[  681.015308] rcu: All QSes seen, last rcu_preempt kthread activity 5250 (4295062511-4295057261), jiffies_till_next_fqs=1, root ->qsmask 0x0
+[  681.027914] rcu: rcu_preempt kthread timer wakeup didn't happen for 5249 jiffies! g12501 f0x2 RCU_GP_WAIT_FQS(5) ->state=0x200
+[  681.039464] rcu:     Possible timer handling issue on cpu=3 timer-softirq=17105
+[  681.046605] rcu: rcu_preempt kthread starved for 5256 jiffies! g12501 f0x2 RCU_GP_WAIT_FQS(5) ->state=0x200 ->cpu=3
+[  681.057184] rcu:     Unless rcu_preempt kthread gets sufficient CPU time, OOM is now expected behavior.
+[  681.066441] rcu: RCU grace-period kthread stack dump:
+[  681.071625] rcu: Stack dump where RCU GP kthread last ran:
+```
+
+
+Fedora serial console errors:
+```
+[  740.494795] watchdog: CPU0: Watchdog detected hard LOCKUP on cpu 1
+[  756.498691] watchdog: BUG: soft lockup - CPU#3 stuck for 22s! [sshd:909]
+[  760.495911] watchdog: CPU0: Watchdog detected hard LOCKUP on cpu 1
+[  764.499137] watchdog: BUG: soft lockup - CPU#4 stuck for 22s! [journal-offline:4082]
+[  764.500137] watchdog: BUG: soft lockup - CPU#6 stuck for 22s! [journal-offline:4084]
+[  764.500402] watchdog: BUG: soft lockup - CPU#7 stuck for 22s! [systemd-journal:585]
+[  768.499360] watchdog: BUG: soft lockup - CPU#5 stuck for 22s! [kworker/u34:11:1657]
+[  772.499585] watchdog: BUG: soft lockup - CPU#2 stuck for 21s! [rcu_exp_gp_kthr:18]
+[  780.497032] watchdog: CPU0: Watchdog detected hard LOCKUP on cpu 1
+[  780.500033] watchdog: BUG: soft lockup - CPU#3 stuck for 44s! [sshd:909]
+```
+
 ### Without a K3
 
 The program also runs under qemu user-mode emulation, which is how the replay was checked
