@@ -1,0 +1,6 @@
+# built binary and run output
+/k3bump2
+k3bump2.log*
+hart[0-9]*/
+stopped-hart[0-9]*/
+watch.log*
