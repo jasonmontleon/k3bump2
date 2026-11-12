@@ -50,8 +50,15 @@ The `Makefile` builds it with clang as a freestanding static program.
 ## Build
 
 The program uses no C library and no headers, and the generated inputs (`snap.*`, `extra.*`) are in
-the repository, so the build needs only clang with the RISC-V target and lld. It works the same on
-the board and as a cross build on any other machine:
+the repository, so the build needs only make, clang with the RISC-V target, and lld:
+
+    apt install make clang lld        # Bianbu, Debian, Ubuntu
+    dnf install make clang lld        # Fedora
+
+lld is a separate package from clang. Without it the build stops with
+`clang: error: invalid linker name in argument '-fuse-ld=lld'`.
+
+The build works the same on the board and as a cross build on any other machine:
 
     make
 
