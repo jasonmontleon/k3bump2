@@ -1,6 +1,6 @@
-/* entry, system calls, and the two ends of the replayed window.  The window never uses gp, so gp carries
- * the pointer to struct ctx while the borrowed code runs; t6 is free at the window's first instruction
- * (a function-call boundary), so the jump into the window goes through it. */
+/* Program start, the system-call helper, and the two ends of the pass.
+ * While the pass runs, gp points to struct ctx (k3lock.c): the pass's exit stub (exit_stub in window.S) finds its way back
+ * through it.  The jump into the pass goes through t6. */
 	.option norelax
 	.text
 	.globl _start
@@ -74,11 +74,11 @@ enter_window:				/* a0 = struct ctx * */
 	ld	x28, 224(gp)
 	ld	x29, 232(gp)
 	ld	x30, 240(gp)
-	ld	x31, 248(gp)		/* = SNAP_START_PC */
+	ld	x31, 248(gp)		/* t6 = the `ret` in window.S; ra = piece_A, so that `ret` lands on the pass's first instruction */
 	jr	x31
 
 	.globl window_exit
-window_exit:				/* reached from the exit stub planted in the borrowed code */
+window_exit:				/* reached from exit_stub in window.S */
 	la	t0, save_area
 	ld	ra, 0(t0)
 	ld	sp, 8(t0)
@@ -100,13 +100,9 @@ window_exit:				/* reached from the exit stub planted in the borrowed code */
 
 	.section .rodata
 	.balign 4096
-	.globl snap_blob
-snap_blob:
-	.incbin "snap.bin"
-	.balign 4096
-	.globl extra_blob
-extra_blob:
-	.incbin "extra.bin"
+	.globl page_blob
+page_blob:
+	.incbin "build/pages.bin"
 
 	.bss
 	.balign 16
@@ -115,10 +111,3 @@ save_area:
 	.space 65536
 mystack_top:
 
-/* 128 KB of nops: run to turn over the instruction cache */
-	.text
-	.balign 64
-	.globl sled
-sled:
-	.fill 32768, 4, 0x00000013
-	ret

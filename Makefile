@@ -1,7 +1,18 @@
-# Cross build with clang + lld (any riscv64 toolchain works: the program is freestanding).
-CC = clang --target=riscv64-linux-gnu
-CFLAGS = -march=rv64gc -mabi=lp64d -mno-relax -O1 -ffreestanding -fno-pic -fno-stack-protector -Wall -Wextra
-LDFLAGS = -nostdlib -static -fuse-ld=lld -Wl,--no-relax -Wl,-z,norelro -Wl,--build-id=none
-k3bump2: k3bump2.c k3bump2_asm.S snap.h snap.bin extra.h extra.bin
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ k3bump2.c k3bump2_asm.S
-# snap.h/snap.bin: pages and registers from the memory dump;  extra.h/extra.bin: python3 mkextra.py DUMPDIR LIBRARY
+# Cross build on any machine with clang, lld, llvm (llvm-readelf), python3 and make.  The result, ./k3lock, is one static
+# riscv64 binary with no dependencies: copy it to the target and run it.
+CC      = clang --target=riscv64-linux-gnu
+LD      = ld.lld
+READELF = llvm-readelf
+TEXT   ?= 0x200000		# address of the driver's code (ten addresses were tried, all work; this one is the most tested)
+CFLAGS  = -march=rv64gc -mabi=lp64d -mno-relax -O1 -ffreestanding -fno-pic -fno-stack-protector -Wall -Wextra
+LDFLAGS = -nostdlib -static -fuse-ld=lld -Wl,--no-relax -Wl,-z,norelro -Wl,--build-id=none -Wl,-Ttext=$(TEXT)
+
+k3lock: k3lock.c k3lock_asm.S build/pages.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ k3lock.c k3lock_asm.S
+
+# window.S + data.S, assembled for their run addresses and packed as pages (build/pages.h, build/pages.bin)
+build/pages.h: window.S data.S build-assets/layout.ld build-assets/mkpages.py
+	python3 build-assets/mkpages.py "$(CC)" $(LD) $(READELF)
+
+clean:
+	rm -rf build k3lock
