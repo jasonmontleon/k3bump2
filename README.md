@@ -9,9 +9,16 @@ own data at its own addresses, so the lock-up can be looked for without a Rust b
 
 ## Is this a standalone reproducer?
 
-Probably yes, but it rests on one lock-up in one run. It took seven copies about six minutes, and it
-isn't yet shown that the hart stops at the same instruction as in rustc; a rerun settles the first
-point.
+It locks up the board, and so far it has done so every time: three runs, three lock-ups.
+
+| System | Runs | Time until the first hart stopped |
+|---|---|---|
+| Fedora 45, kernel 7.3.4 (8 harts online), seven copies on harts 0-6 | 2 | 341 s and 71 s |
+| Bianbu, vendor kernel (16 harts online) | 1 | under 1 s |
+
+Not yet shown: that the hart stops at the same instruction as in rustc; that the missing page-table
+entry is what decides it in this program (the `mapped` control has not been run yet); whether a
+single copy is enough.
 
 It is standalone in the sense that matters for running it: one static binary, no libraries, no root,
 no Fedora files on disk. It is not small or clean, though: the 15 MB binary carries a piece of the
@@ -102,8 +109,10 @@ that is far too short to mean anything.
     /path/to/runwide.sh 0-6 4 mapped     # control: the page mapped in every copy
 
 Leave at least one hart out of the list: the watcher moves itself there, so that it does not freeze
-together with a hart that dies. The one lock-up so far came from `runwide.sh 0-6 4`: the first hart
-stopped after 341 s (3.8 million passes on that hart), five more within the next 31 s.
+together with a hart that dies. The two Fedora lock-ups in the table above came from
+`runwide.sh 0-6 4`. After the first hart stops, the other copies stop too, over the next seconds to
+minutes: other processes get stuck in the kernel waiting for the dead hart and take the remaining
+harts with them.
 
 Each copy logs to `hart<N>/k3bump2.log`. Once a second the watcher looks at every copy, and when one
 stops making progress it says which kind of stop it is:
@@ -117,12 +126,31 @@ pass it stopped. Everything the watcher finds goes to the terminal and to `watch
 the kernel version and command line. Logs of earlier runs in the same directory are renamed, not
 overwritten. Ctrl-C stops all copies.
 
-After a lock-up and power-cycle:
+Treat the watcher as best-effort. Once a hart is dead, disk writes and ssh sessions can stall and
+any process may get stuck, the watcher included. In the one lock-up it has been through so far
+(Fedora), nothing after its start-up lines reached `watch.log` and no memory was saved. The
+`hart<N>/k3bump2.log` files, which the copies write themselves, did survive and show when each copy
+stopped. The kernel console is the reliable record of which hart died.
 
-    cat watch.log
+### What a lock-up looks like
 
-The watcher's dead-hart verdict has been tested only with a stand-in on another machine, not yet on
-a hart that really died.
+The "passes" lines stop, and the machine stops answering over the following seconds to minutes. It
+does not recover; power-cycle it. What the kernel prints on its console depends on how the kernel
+was built.
+
+Fedora has the lock-up watchdogs. The "hard LOCKUP" line names the dead hart; the "soft lockup"
+lines are other harts that got stuck afterwards:
+
+    watchdog: CPU0: Watchdog detected hard LOCKUP on cpu 1
+    watchdog: BUG: soft lockup - CPU#3 stuck for 22s! [sshd:909]
+    watchdog: BUG: soft lockup - CPU#4 stuck for 22s! [journal-offline:4082]
+
+Bianbu's kernel has no lock-up watchdogs. After 21 s its RCU stall detector reports instead, and
+the `cpu=` number is the dead hart:
+
+    rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:
+    rcu: rcu_preempt kthread timer wakeup didn't happen for 5249 jiffies! g12501 f0x2 RCU_GP_WAIT_FQS(5) ->state=0x200
+    rcu:     Possible timer handling issue on cpu=3 timer-softirq=17105
 
 ### Without a K3
 
