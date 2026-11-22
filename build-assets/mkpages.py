@@ -8,19 +8,23 @@ result into the two files the driver is compiled with:
 kind 0 = code (r-x), 1 = read-only data, 2 = writable data, 3 = writable data that the driver copies back from this
 pristine copy before every pass (such a page is listed COPIES times, so it is copied that often).
 
-usage: mkpages.py CC LD READELF      e.g.  mkpages.py "clang --target=riscv64-linux-gnu" ld.lld llvm-readelf"""
-import os, re, subprocess, sys
-cc, ld, readelf = sys.argv[1].split(), sys.argv[2], sys.argv[3]
+usage: mkpages.py CC LD      e.g.  mkpages.py "clang --target=riscv64-linux-gnu" ld.lld"""
+import os, re, struct, subprocess, sys
+cc, ld = sys.argv[1].split(), sys.argv[2]
 COPIES = 8
 os.makedirs('build', exist_ok=True)
 for f in ('window', 'data'):
     subprocess.run(cc + ['-march=rv64gcv_zba_zbb_zbs_zcb', '-mno-relax', '-c', '-o', 'build/%s.o' % f, f + '.S'], check=True)
 subprocess.run([ld, '--no-relax', '-T', 'build-assets/layout.ld', '-e', '0', '-o', 'build/window.elf', 'build/window.o', 'build/data.o'], check=True)
 elf = open('build/window.elf', 'rb').read(); pages = {}
-for l in subprocess.run([readelf, '-S', '-W', 'build/window.elf'], capture_output=True, text=True, check=True).stdout.split('\n'):
-    m = re.match(r'\s*\[\s*\d+\]\s+(\.(?:r_|g_|data2_|copy8_|front)\S*)\s+PROGBITS\s+([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)', l)
-    if not m: continue
-    name, addr, off, size = m.group(1), int(m.group(2), 16), int(m.group(3), 16), int(m.group(4), 16)
+def sections(e):          # (name, address, file offset, size) of every section with contents, read from the ELF64 section headers
+    shoff, = struct.unpack_from('<Q', e, 0x28); shentsize, shnum, shstrndx = struct.unpack_from('<HHH', e, 0x3a)
+    hdr = [struct.unpack_from('<IIQQQQ', e, shoff + i * shentsize) for i in range(shnum)]      # name, type, flags, addr, offset, size
+    stroff = hdr[shstrndx][4]
+    for nameoff, typ, flags, addr, off, size in hdr:
+        if typ == 1: yield e[stroff + nameoff:e.index(b'\0', stroff + nameoff)].decode(), addr, off, size      # SHT_PROGBITS
+for name, addr, off, size in sections(elf):
+    if not re.match(r'\.(r_|g_|data2_|copy8_|front)', name): continue
     kind = 0 if name.startswith(('.r_', '.front')) else 1 if name.startswith('.g_') else 2 if name.startswith('.data2_') else 3
     if kind >= 2: pages.setdefault(addr & ~0xfff, [kind, bytearray(4096)])          # data pages exist even where they are zero
     for k, x in enumerate(elf[off:off + size]):

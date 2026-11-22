@@ -1,18 +1,60 @@
-# k3lock: a small program that locks up a SpacemiT X100 hart
+# k3lock: a small program that hard-locks a SpacemiT K3 (X100) core
 
-Status 2026-11-21: tested on one SpacemiT K3 CoM260 (8 x X100, Fedora 45, kernel 7.3.5) only. Run counts are given below;
-several statements rest on one or two runs and are marked as such. Nothing here explains WHY the hart stops.
+## What this is and why it exists
 
-The earlier reproducer in this repository (a replay of the last 37,709 instructions before a lock-up of a real rustc build,
-15 MB) is on the branch `v1-37k-instruction-replay`. This program was cut down from it step by step: 298 instructions per
-pass, 19 pages, 125 KB.
+Fedora's RISC-V build system uses SpacemiT K3 Pico-ITX boards as package builders among other systems. When the Rust compiler 
+package was built for the RVA23 profile on these builders, the builder repeatedly locked up hard: one core (hart) stopped 
+executing, the kernel reported a hard lock-up on that CPU, and the machine had to be power-cycled. The same package built for 
+the older rv64gc baseline completed on the same boards and kernels. The problem is tracked in
+https://forge.fedoraproject.org/riscv/planning/issues/40.
 
-## What it does
+This repository contains a small standalone program that causes the same lock-up within seconds, without a compiler, a build
+root or any Fedora files. It was made by recording the last 37,709 instructions the Rust compiler executed on a hart before one
+such lock-up, replaying them in a loop, and then removing everything that could be removed while the lock-up still occurred.
+What is left is 298 instructions per loop, still at their original addresses, and 16 words of data. The on-chip instruction
+trace shows that this program stops at the same instruction as the real compiler run did.
+
+What it is for: giving someone who can look inside the core (or its firmware) a short, readable, fast test case. It shows
+WHAT has to be present for the lock-up; it does not explain WHY the core stops.
+
+What is and is not known about RVA23: the lock-up was found with RVA23 code, and the 298 instructions include five
+vector-extension instructions (inside the function `F1`, two small vector copies). In one test, turning those five into
+no-ops stopped the lock-up. Everything else in the program is plain rv64gc code, and the other things the lock-up needs (see
+"The elements" below) have nothing to do with RVA23: a page that ends in half a branch instruction with no page mapped after
+it, two-instruction far calls, and other cores of the same cluster busy with memory traffic. Whether code without any vector
+instruction can trigger it has not been established either way.
+
+It works on both K3 boards tried: a K3 CoM260 (8 x X100, Fedora 45, kernel 7.3.5), where all the experiments described
+below were done, and a K3 Pico-ITX, the board type of the builders, where the lock-up was confirmed as well.
+It works under both operating systems tried, Fedora and Bianbu (SpacemiT's own distribution).
+Run counts are given below; several statements rest on one or two runs and are marked as such.
+
+## Build and run
+
+Build on any machine (cross build; needs `make`, `clang`, `lld`, `python3`; on Fedora: `dnf install make clang lld python3`):
+```
+make
+```
+Copy the one file `k3lock` to the K3 system and run it there:
+```
+./k3lock                    # six workers (harts 0,1,3,4,5,6) + two readers (harts 2,7); expect a stop within seconds
+./k3lock -c 3               # one worker on hart 3 + readers on harts 0,1,2; can take minutes
+./k3lock mapped             # control: must run to the end
+                            # -c LIST worker harts   -l LIST|none reader harts   -t SECONDS (default 60)
+```
+Every worker runs the same 298 instructions over and over (one run-through is called a "pass" in this README) and prints
+once a second how many passes it has done. A locked worker's count stops; on Fedora the kernel then reports a hard
+lock-up on that CPU on the serial console (see below), and the rest of the system usually freezes within seconds because
+it waits for the dead hart, so run it from the serial console or expect the ssh session to hang.
+
+**A locked hart cannot be recovered: the board needs a power cycle. Do not run this on a machine you cannot power-cycle.**
+
+## What happens when it runs
 
 `./k3lock` starts six "worker" processes pinned to harts 0, 1, 3, 4, 5, 6 and two
-"reader" processes on harts 2 and 7 (each reads a 64 MB buffer in a loop). Every worker repeats one short pass forever and
-prints its pass count once a second. On the test board one or more workers stop within about 6 seconds (2 of 2 runs; three
-harts locked each time): such a hart no longer executes instructions, does not take interrupts, and cannot be halted
+"reader" processes on harts 2 and 7 (each reads a 64 MB buffer in a loop). Every worker repeats the pass forever and
+prints its pass count once a second. On the CoM260 one or more workers stop within 6 to 10 seconds (4 of 4 runs; one to
+three harts locked each time): such a hart no longer executes instructions, does not take interrupts, and cannot be halted
 through the debug module (seen on this program's ancestors: dmstatus 0x00400ca3, "running", not "unavailable"; halt requests
 are not acknowledged). The kernel reports a hard lock-up on that CPU a few seconds later, and the rest of the system usually
 freezes soon after because it waits for the dead hart.
@@ -23,15 +65,27 @@ four runs locked after 5.5 s, 25 s, 170 s and 182 s.
 `./k3lock mapped` (or `-c 3 mapped`) is the control: identical, except that the one page the reproducer leaves unmapped is
 mapped. It has never locked (six workers: 120 s, 150 M passes in total; one worker: 2 runs of 240 s, 53 M passes each).
 
+### What the kernel prints
+With k3lock on Bianbu the kernel names the stopped hart like this (here hart 3):
+```
+[  127.401177] rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:
+[  127.404710] rcu:     3-...0: (7 ticks this GP) idle=79dc/1/0x4000000000000000 softirq=1457/1459 fqs=1942
+[  127.414049] rcu:              hardirqs   softirqs   csw/system
+[  127.419689] rcu:      number:        0          0            0
+[  127.425330] rcu:     cputime:        0          0            0   ==> 10528(ms)
+[  127.432386] rcu:     (detected by 5, t=5259 jiffies, g=2793, q=38 ncpus=16)
+```
+On Fedora it is `watchdog: CPUn: Watchdog detected hard LOCKUP on cpu 3`, followed by soft lock-ups of the other CPUs.
+
 ## The files
 
-| file | what | lines |
-|---|---|---|
-| `window.S` | the pass: every instruction it executes, at the address it had in the original process | 281 |
-| `data.S` | the 16 data words the pass reads, and the page that ends in half a branch | 44 |
-| `k3lock.c` | driver: map the pages, start the workers and readers, loop (copy one page 8 times, run the pass, count) | 157 |
-| `k3lock_asm.S` | program start, system call, entering and leaving the pass | 113 |
-| `build-assets/` | build step only, nothing here runs on the target: `layout.ld` (the address of every piece of `window.S` and `data.S`) and `mkpages.py` (assembles the two files for those addresses and packs them as the page table the driver is compiled with) | |
+| file | what |
+|---|---|
+| `window.S` | The code that triggers the lock-up: the 298 instructions taken from the Rust compiler run, in assembly. A hart runs through them once, start to end, and then starts over; this README calls one such run-through a "pass". Each piece of the code is placed at the same memory address it had inside the compiler, because the lock-up depends on those addresses. |
+| `data.S` | The memory contents that code needs: the 16 data words it reads, and one page of memory that is never executed and ends in the first half of a branch instruction (see "The elements" below). |
+| `k3lock.c` | The driver, ordinary C. It puts the contents of `window.S` and `data.S` at their addresses, starts the worker and reader processes, and makes each worker repeat the pass and print how many passes it has done. |
+| `k3lock_asm.S` | A few lines of assembly the driver needs: the program's entry point, the system-call helper, and the jump from the driver into the pass and back. |
+| `build-assets/` | Used only while building; nothing in here runs on the target. `layout.ld` lists the memory address of every piece of `window.S` and `data.S`; `mkpages.py` assembles the two files for those addresses and packs the result into a table that is compiled into the driver. |
 
 `make` produces one static binary, `k3lock` (no libc, no dynamic loader). Generated files go to `build/`.
 
@@ -129,77 +183,7 @@ page that ends in half a branch).
 - This program, one worker (`./k3lock -c 3`): 6 of 6 runs locked (5.5 s, 8 s, 25 s, 35 s, 170 s, 182 s).
   `./k3lock -c 3 mapped`: 2 of 2 runs of 240 s without a stop (53 M passes each).
 
-## Build and run
+## The earlier reproducer
 
-Build on any machine (cross build; needs `make`, `clang`, `lld`, `llvm` for llvm-readelf, `python3`):
-```
-make
-```
-Copy the one file `k3lock` to the K3 system and run it there:
-```
-./k3lock                    # six workers (harts 0,1,3,4,5,6) + two readers (harts 2,7); expect a stop within seconds
-./k3lock -c 3               # one worker on hart 3 + readers on harts 0,1,2; can take minutes
-./k3lock mapped             # control: must run to the end
-                            # -c LIST worker harts   -l LIST|none reader harts   -t SECONDS (default 60)
-```
-Every worker prints its pass count once a second. A locked worker's count stops; on Fedora the kernel then reports a hard
-lock-up on that CPU on the serial console (see below), and the rest of the system usually freezes within seconds because
-it waits for the dead hart, so run it from the serial console or expect the ssh session to hang.
-
-**A locked hart cannot be recovered: the board needs a power cycle. Do not run this on a machine you cannot power-cycle.**
-
-### Errors
-Depending whether running on Bianbu or Fedora the errors that appear on the serial console will look a little different. This probably comes down to the difference in the kernel config where the lockup watchdogs are not enabled in Bianbu but are in Fedora.
-Bianbu config:
-```
-# grep -E 'LOCKUP_DETECTOR|RCU_CPU_STALL_TIMEOUT|CONFIG_HZ=' /boot/config-$(uname -r)
-CONFIG_HZ=250
-# CONFIG_SOFTLOCKUP_DETECTOR is not set
-CONFIG_HAVE_HARDLOCKUP_DETECTOR_BUDDY=y
-# CONFIG_HARDLOCKUP_DETECTOR is not set
-CONFIG_RCU_CPU_STALL_TIMEOUT=21
-```
-
-Fedora config:
-```
-# grep -E 'LOCKUP_DETECTOR|RCU_CPU_STALL_TIMEOUT|CONFIG_HZ=' /boot/config-$(uname -r)
-CONFIG_HZ=1000
-CONFIG_LOCKUP_DETECTOR=y
-CONFIG_SOFTLOCKUP_DETECTOR=y
-CONFIG_SOFTLOCKUP_DETECTOR_INTR_STORM=y
-CONFIG_HAVE_HARDLOCKUP_DETECTOR_BUDDY=y
-CONFIG_HARDLOCKUP_DETECTOR=y
-# CONFIG_HARDLOCKUP_DETECTOR_PERF is not set
-CONFIG_HARDLOCKUP_DETECTOR_BUDDY=y
-# CONFIG_HARDLOCKUP_DETECTOR_ARCH is not set
-CONFIG_HARDLOCKUP_DETECTOR_COUNTS_HRTIMER=y
-CONFIG_RCU_CPU_STALL_TIMEOUT=60
-```
-
-Bianbu serial console errors:
-```
-[  681.004745] rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:
-[  681.008258] rcu:     (detected by 4, t=5252 jiffies, g=12501, q=3207 ncpus=16)
-[  681.015308] rcu: All QSes seen, last rcu_preempt kthread activity 5250 (4295062511-4295057261), jiffies_till_next_fqs=1, root ->qsmask 0x0
-[  681.027914] rcu: rcu_preempt kthread timer wakeup didn't happen for 5249 jiffies! g12501 f0x2 RCU_GP_WAIT_FQS(5) ->state=0x200
-[  681.039464] rcu:     Possible timer handling issue on cpu=3 timer-softirq=17105
-[  681.046605] rcu: rcu_preempt kthread starved for 5256 jiffies! g12501 f0x2 RCU_GP_WAIT_FQS(5) ->state=0x200 ->cpu=3
-[  681.057184] rcu:     Unless rcu_preempt kthread gets sufficient CPU time, OOM is now expected behavior.
-[  681.066441] rcu: RCU grace-period kthread stack dump:
-[  681.071625] rcu: Stack dump where RCU GP kthread last ran:
-```
-
-
-Fedora serial console errors:
-```
-[  740.494795] watchdog: CPU0: Watchdog detected hard LOCKUP on cpu 1
-[  756.498691] watchdog: BUG: soft lockup - CPU#3 stuck for 22s! [sshd:909]
-[  760.495911] watchdog: CPU0: Watchdog detected hard LOCKUP on cpu 1
-[  764.499137] watchdog: BUG: soft lockup - CPU#4 stuck for 22s! [journal-offline:4082]
-[  764.500137] watchdog: BUG: soft lockup - CPU#6 stuck for 22s! [journal-offline:4084]
-[  764.500402] watchdog: BUG: soft lockup - CPU#7 stuck for 22s! [systemd-journal:585]
-[  768.499360] watchdog: BUG: soft lockup - CPU#5 stuck for 22s! [kworker/u34:11:1657]
-[  772.499585] watchdog: BUG: soft lockup - CPU#2 stuck for 21s! [rcu_exp_gp_kthr:18]
-[  780.497032] watchdog: CPU0: Watchdog detected hard LOCKUP on cpu 1
-[  780.500033] watchdog: BUG: soft lockup - CPU#3 stuck for 44s! [sshd:909]
-```
+The first reproducer in this repository, a replay of all 37,709 recorded instructions (15 MB), is on the branch
+`v1-37k-instruction-replay`.
