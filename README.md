@@ -86,6 +86,7 @@ On Fedora it is `watchdog: CPUn: Watchdog detected hard LOCKUP on cpu 3`, follow
 | `k3lock.c` | The driver, ordinary C. It puts the contents of `window.S` and `data.S` at their addresses, starts the worker and reader processes, and makes each worker repeat the pass and print how many passes it has done. |
 | `k3lock_asm.S` | A few lines of assembly the driver needs: the program's entry point, the system-call helper, and the jump from the driver into the pass and back. |
 | `build-assets/` | Used only while building; nothing in here runs on the target. `layout.ld` lists the memory address of every piece of `window.S` and `data.S`; `mkpages.py` assembles the two files for those addresses and packs the result into a table that is compiled into the driver. |
+| `debug/reset-into-debug.tcl` | OpenOCD procedures for examining a hart after it has locked (see "Unlocking a locked hart with a debugger"). Not needed to reproduce the lock-up. |
 
 `make` produces one static binary, `k3lock` (no libc, no dynamic loader). Generated files go to `build/`.
 
@@ -182,6 +183,237 @@ page that ends in half a branch).
   `./k3lock mapped`: 2 of 2 runs of 120 s without a stop (about 25 M passes on each of the six workers).
 - This program, one worker (`./k3lock -c 3`): 6 of 6 runs locked (5.5 s, 8 s, 25 s, 35 s, 170 s, 182 s).
   `./k3lock -c 3 mapped`: 2 of 2 runs of 240 s without a stop (53 M passes each).
+
+## Unlocking a locked hart with a debugger
+
+A locked hart ignores halt requests. It can be forced into debug mode by resetting that one core while the debug module's
+"halt on reset" request is set for it. The hart then sits halted and its registers can be read. The reset clears the program
+counter and the trap registers; it does not clear the integer registers (see the next section). The hart does not continue
+the program afterwards.
+
+Tested on 5 locked harts, 5 times successful (K3 CoM260).
+
+### Requirements
+
+- A JTAG probe connected to the K3's JTAG port.
+- OpenOCD with the K3 target file (`target/spacemit-k3.cfg`, in OpenOCD since 2026), started AFTER the lock-up, with only the
+  two X100 clusters:
+
+  ```
+  openocd -f <your-probe>.cfg -c "set CLUSTERS {0 1}" -f target/spacemit-k3.cfg
+  ```
+  OpenOCD prints for the locked hart, here hart 5:
+  `Error: [k3.x100.5] Unable to halt. dmcontrol=0x00010001, dmstatus=0x00400ca3` and
+  `Fatal: Hart 5 failed to halt during examine`. That is expected; the other harts are examined normally.
+- A command connection to OpenOCD: `telnet localhost 4444`.
+
+### Values for each hart
+
+Find the row of the locked hart. Each command in the steps below is built from the values of that one row.
+
+| N | PREFIX | DMCONTROL | DMSTATUS | COMMAND | DATA0 | DATA1 | HALTREQ | ARM | POP |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | `k3.x100.4` | 0x10 | 0x11 | 0x17 | 0x04 | 0x05 | 0x80000001 | 0x00000009 | 0x00000001 |
+| 1 | `k3.x100.0` | 0x10 | 0x11 | 0x17 | 0x04 | 0x05 | 0x80010001 | 0x00010009 | 0x00000008 |
+| 2 | `k3.x100.0` | 0x10 | 0x11 | 0x17 | 0x04 | 0x05 | 0x80020001 | 0x00020009 | 0x00000040 |
+| 3 | `k3.x100.0` | 0x10 | 0x11 | 0x17 | 0x04 | 0x05 | 0x80030001 | 0x00030009 | 0x00000200 |
+| 4 | `k3.x100.0` | 0x410 | 0x411 | 0x417 | 0x404 | 0x405 | 0x80000001 | 0x00000009 | 0x00010000 |
+| 5 | `k3.x100.0` | 0x410 | 0x411 | 0x417 | 0x404 | 0x405 | 0x80010001 | 0x00010009 | 0x00080000 |
+| 6 | `k3.x100.0` | 0x410 | 0x411 | 0x417 | 0x404 | 0x405 | 0x80020001 | 0x00020009 | 0x00400000 |
+| 7 | `k3.x100.0` | 0x410 | 0x411 | 0x417 | 0x404 | 0x405 | 0x80030001 | 0x00030009 | 0x02000000 |
+
+What the columns are:
+
+- **N**: the number of the locked hart. The kernel names it, and so does the OpenOCD error shown above.
+- **PREFIX**: the word every command starts with. OpenOCD calls hart N `k3.x100.N` (hart 0 is `k3.x100.0`, hart 1 is
+  `k3.x100.1`, ...), and every command must start with the name of a hart that is NOT locked, because a locked hart is one
+  OpenOCD could not attach to. The table suggests `k3.x100.0`, or `k3.x100.4` when hart 0 is the locked one. Several harts
+  can lock in the same run: if the suggested hart is locked too (OpenOCD printed the "failed to halt" error for it as well,
+  and commands through it fail with "Memory not ready"), use the name of any other hart instead. The prefix does not select
+  which hart is acted on; the addresses and values in the other columns do.
+- **DMCONTROL, DMSTATUS, COMMAND, DATA0, DATA1**: addresses of debug-module registers. Harts 0-3 and harts 4-7 have separate
+  debug modules; the second one's registers are 0x400 higher.
+- **HALTREQ, ARM**: values to write to DMCONTROL. Both contain the hart's index inside its debug module (bits 17:16) and
+  `dmactive` (bit 0); HALTREQ adds `haltreq` (bit 31), ARM adds `setresethaltreq` (bit 3).
+- **POP**: the hart's power-on-reset bit in the SoC register `APMU_PMU_CC2_AP` at physical address 0xd4282900 (bit numbers
+  from Linux, `drivers/reset/spacemit/reset-spacemit-k3.c`, `RESET_APMU_CPUn_POP`).
+
+### Steps
+
+Type these in the telnet session, replacing each word in capitals by the value in the table row of the locked hart.
+
+1. Stop OpenOCD's background polling:
+   ```
+   poll off
+   ```
+2. Confirm the hart is locked: request a halt, wait half a second, read the status.
+   ```
+   PREFIX riscv dmi_write DMCONTROL HALTREQ
+   sleep 500
+   PREFIX riscv dmi_read DMSTATUS
+   ```
+   A locked hart answers `0x400ca3` (bits 9 and 8, "halted", are 0). If the answer has 0x300 set, e.g. `0x4303a3`, the hart
+   halted normally: it is not locked, stop here.
+3. Withdraw the halt request and set "halt on reset" for this hart:
+   ```
+   PREFIX riscv dmi_write DMCONTROL ARM
+   ```
+4. Pulse the hart's power-on reset through the debug module's system-bus access:
+   ```
+   PREFIX riscv set_mem_access sysbus
+   PREFIX mww phys 0xd4282900 POP
+   sleep 50
+   PREFIX mww phys 0xd4282900 0
+   sleep 300
+   ```
+5. Read the status again:
+   ```
+   PREFIX riscv dmi_read DMSTATUS
+   ```
+   Expected: `0x4c03a3` (bits 19:18 "have reset" and bits 9:8 "halted"). The hart is now in debug mode.
+6. Read a register: write an abstract command to COMMAND, then read DATA1 (upper 32 bits) and DATA0 (lower 32 bits).
+   The command is 0x00320000 + register number; register numbers are 0x1000 + n for x0..x31 and the CSR number for a CSR
+   (dpc is 0x7b1).
+   ```
+   PREFIX riscv dmi_write COMMAND 0x00321001
+   PREFIX riscv dmi_read DATA1
+   PREFIX riscv dmi_read DATA0
+   ```
+   This reads x1. On a hart locked by this reproducer it gave `0x3f` and `0xeb846500`, i.e. 0x3feb846500, every time.
+   With 0x003207b1 (dpc) it gives `0x1` and `0x2ec`: 0x1000002ec, the address where the core starts after a reset.
+
+`debug/reset-into-debug.tcl` contains the same steps as OpenOCD procedures: after `source debug/reset-into-debug.tcl`,
+`hrescue N` does steps 1 to 5 and `hregs N` reads all integer registers and the trap registers.
+
+Afterwards power-cycle the board. The system has been frozen since the lock-up, and the reset hart has lost its place.
+
+Example: hart 0 is the locked hart, so the row N = 0 is used and every command starts with `k3.x100.4` (the output of each
+command is after the arrow):
+```
+k3.x100.4 riscv dmi_write 0x10 0x80000001
+k3.x100.4 riscv dmi_read 0x11                 -> 0x400ca3
+k3.x100.4 riscv dmi_write 0x10 0x00000009
+k3.x100.4 riscv set_mem_access sysbus
+k3.x100.4 mww phys 0xd4282900 0x00000001
+k3.x100.4 mww phys 0xd4282900 0
+k3.x100.4 riscv dmi_read 0x11                 -> 0x4c03a3
+k3.x100.4 riscv dmi_write 0x17 0x00321001
+k3.x100.4 riscv dmi_read 0x5                  -> 0x3f
+k3.x100.4 riscv dmi_read 0x4                  -> 0xeb846500
+```
+
+What does NOT work (tried on locked harts): a halt request alone; the debug module's own resets (`hartreset`, `ndmreset`);
+the "software reset" bit next to POP (the POP value times 2), one try; the firmware's core power-down and wake-up registers;
+and, from another hart of the same program, mapping the missing page, overwriting the half branch, or rewriting the data and
+stack the locked hart was using.
+
+Do not probe the second TAP in the K3's JTAG chain (IDCODE 0x08502c0d, 9-bit instruction register) with unknown
+instructions: doing so froze the board.
+
+### What the registers of a locked hart hold
+
+How to read this. A core of this kind has more places to hold register values than the 31 architectural registers
+(x1..x31, the names a program uses). These places are the physical registers. While the core runs, each architectural
+register is mapped to one physical register, and the mapping changes constantly (register renaming): an instruction that
+writes a register is given a fresh physical register from a free list. A reset puts the mapping back to its initial state but
+does not clear the physical registers. So after the reset, reading an architectural register shows whatever the program
+happened to leave in the physical register that name is mapped to at start-up: the VALUES are real leftovers of the locked
+worker, but the NAME a value appears under means nothing. Which physical register a value was left in depends on the core's
+state when it locked and differs from one lock-up to the next. (That this core is built this way is an assumption; it is the
+usual design and it fits what is seen.)
+
+Result on four locked harts: the same collection of values every time, under different names. Each row below is one value;
+the hart columns show under which architectural register(s) it was read on that hart ("-" = not among the 31 that can be
+read).
+
+| value | what it is | hart 1 | hart 3 | hart 5 | hart 6 |
+|---|---|---|---|---|---|
+| 0x3ff5a9415e | return address of F1's second call (the instruction after the call in piece C) | a3 | a0 | s1 | s1 |
+| 0x3feb8465b0 | stack pointer after F1 has returned (`STACK_TOP`) | s8 | a7 | s3 | s3 |
+| 0x3feb846500 | stack pointer inside F1 | ra | ra | ra | ra |
+| 0x3feb8499c0 | `OBJECT`, the pointer handed to F1 | t0, s1, a7 | t2, s1 | t1, s0 | t1, s0 |
+| 0x3feb849a58 | `OBJECT` + 0x98 | t1 | a2 | a0 | a0 |
+| 0x3feb849a70 | `OBJECT` + 0xb0 | - | t4, t5 | t5 | - |
+| 0x3feb849a80 | `OBJECT` + 0xc0 | s2 | a6 | s2 | a7 |
+| 0x16 | F1's cursor: 22, the value of the second call | a0 | a3 | a1 | a1 |
+| 0xdf1 | a field of array element 22 | s6, t3 | s7, t3 | s7, t3 | s10, t5 |
+| 0x38 | a field of array element 22 | s10 | s5 | s5 | s8 |
+| 0x4 | a field of array element 22 | - | s9 | s10 | t3 |
+| 0x400026da50000 | intermediate result of F1's shifts on those fields | - | s10 | s11 | t4 |
+| 0x8000000000000 | intermediate result of F1's shifts on those fields | a2 | s11 | a2 | s4 |
+| 0xffff | a mask F1 builds | t2 | t0 | t0 | t0 |
+| 0x3ff30199bc | link value written by the `jalr t1, t3` in `stub_F1` | s3 | a4 | a7 | a6 |
+| 0x3ff301ffec | link value written by the `jalr t1, t3` in `stub_helper2` | - | - | t4 | - |
+| 0x3ff2ee276e | address of the `ret` the driver enters the pass through | t5 | - | - | - |
+| 0x1 | constant | sp, gp | gp, tp | gp, tp | gp, tp |
+| 0xffffffffffffffff | constant | s0 | s0 | t2 | t2 |
+| 0x21e1b8 | a pointer into the driver's own data | tp | sp | sp | sp |
+| 0 | (physical register holds 0) | 11 names | 9 names | 9 names | 11 names |
+
+(Hart 1 was reset twice before it was read; harts 5 and 6 locked in the same run; a fifth locked hart, hart 0, was only
+checked for x1 = 0x3feb846500 and the start address.)
+
+What is never there: the values the final far call of piece C would produce (its `auipc` result 0x3ff5a89166 and its link
+value 0x3ff5a9416e), and the stack pointer its target would set. That agrees with the instruction trace (F1 returns, four
+no-ops complete, the far call does not), with two cautions: every pass computes the same values, so a value may be left over
+from an earlier pass, and only 31 of the core's physical registers can be read this way.
+
+After the reset the trap registers are cleared: `mepc`, `mcause`, `mtval`, `sepc`, `scause`, `stval` and `satp` read 0,
+`mstatus` reads 0xa00001900, and `dpc` is 0x1000002ec, the address where the core starts after a reset.
+
+### Markers: what the core executed in the pass it locked in
+
+To learn more from those registers, variants of the program were made in which the values differ from pass to pass. The driver
+puts the pass number (times 256) into a register the pass never uses, and some of the pass's no-ops are replaced by
+instructions that add that number to a small tag and leave the sum in a register. A marker found after a lock-up therefore
+shows which instruction wrote it and in which pass. Markers were put in the four instructions between F1's return and the
+final far call, in six instructions of the far call's target, and at the start of piece C. All seven variants still
+lock. (These variants are not in this repository.)
+
+How to read the result: a marker that is found proves that its instruction executed in that pass. A marker that is not
+found proves nothing by itself, because only 31 of the core's physical registers can be read (see above): the instruction may not
+have executed, or its result may sit in a physical register that cannot be read.
+
+40 register images from 26 lock-ups:
+
+| marker | found |
+|---|---|
+| any marker found carries the number of the pass in which that hart locked | 40 of 40 |
+| first instruction of piece C | 40 of 40 |
+| 1st instruction after F1's return | 40 of 40, whichever register it writes |
+| 2nd instruction after F1's return | 0 of 40 |
+| 3rd instruction after F1's return | 9 of 31 |
+| 4th instruction after F1's return (the last before the far call) | 0 of 40 |
+| any of the six in the far call's target | 0 of 40 |
+
+Established by this: the values in the registers of a locked hart are from the pass it locked in, not leftovers of earlier
+passes; and in that pass the core executed past F1's return, at least as far as the third of the four instructions before the
+far call.
+
+Not established: whether the fourth instruction and the far call's target are executed. The registers never show a result
+of the 2nd or 4th instruction, and they always show the OLD values of the two registers those instructions overwrite. The
+instruction trace of the same variant, however, reports all four instructions as completed and only the far call as not.
+These two do not agree, and telling which is right needs knowledge of how the core stores register values.
+
+**A regularity that may matter: the state of register renaming (suggestive, not proven).** What is readable after a lock-up is almost the same every time:
+the same results, the same old values, over 40 images, 26 lock-ups and 7 variants. If the core allocates physical registers
+from a free list in rotation and the 31 readable ones are fixed, that should not happen when a hart stops at an arbitrary
+moment: which results end up in readable physical registers would differ from one lock-up to the next. It would happen if
+the hart always stops with its free list and rename map in the same state, i.e. if the lock-up needs one particular state of
+register renaming.
+
+One test was made. Three, and in another variant seven, extra register-writing instructions were inserted earlier in the
+pass. If lock-ups could happen at any position of the rotation, the readable results should have moved by three or seven
+places. They did not move: the result of the first instruction after F1's return was still the readable one, and of the
+inserted instructions only the last was readable. That leaves two readings:
+
+- the lock-up only happens at one position of the rotation, so the inserted instructions merely changed in which pass that
+  position comes round, and what is readable stays fixed relative to the point where the hart stops; or
+- the readable registers are not selected by rotation at all (for instance they show the last value given to each
+  architectural register), and then the regularity says nothing about register renaming.
+
+Neither reading fits every detail of the images, so this is offered as an observation for someone who knows the core's
+register renaming, not as a finding.
 
 ## The earlier reproducer
 
