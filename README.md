@@ -22,7 +22,7 @@ Zicbom extension). It can therefore be run unchanged on other RISC-V boards that
 the end.
 
 **One fault, two programs.** [k3skip](https://github.com/jasonmontleon/k3skip) is the same program with one number
-changed (6 instead of 4 no-ops in front of the last far call). There the hart does not lock; an instruction is skipped
+changed (9 instead of 4 no-ops in front of the last far call). There the hart does not lock; an instruction is skipped
 instead and the program computes a wrong result. See "One fault, several forms".
 
 ## Build and run
@@ -195,8 +195,7 @@ Further conditions:
 - **The final far call** must be the adjacent `auipc`+`jalr` pair (`auipc ra; c.nop; jalr ra`: no lock in 315 M passes;
   `nop; jal` instead: no lock), and the number of instructions between F1's return address and the `auipc` decides what
   happens (next section). It is the number of instructions, not of bytes: 2 four-byte no-ops behave like 2 two-byte ones.
-- **F1's copies.** Deleting the five copy instructions (vector or floating-point) without replacement nearly switches
-  the failure off; whether they are vector or floating-point instructions makes no difference to the lock-up.
+- **F1's stores.** See "What F1 needs" below, which supersedes the three F1 rows of the table above.
 
 Our reading (inferred from which variants lock; the wrong path itself was never observed): F1's `ret` is one instruction
 that returns to two places in every pass. At the second return the core guesses the first return address. Because F1's
@@ -226,11 +225,59 @@ jump that had already been taken. The kernel returned there, so one instruction 
 that is, the program computes a wrong value, runs into bytes that are not code (illegal-instruction trap), or jumps to
 address 0.
 
-With the rv64gc form in this repository: 4 no-ops lock (this program), 6 give wrong results
-([k3skip](https://github.com/jasonmontleon/k3skip)), 3 locked on the vendor kernel (4 of 4 runs) and not on the 7.3 kernel
-(3 runs of 180 s), 2 locked in 1 of 3 runs on the 7.3 kernel.
+With the rv64gc form in this repository, on a 7.3.6 kernel: 4 no-ops lock (this program); 9 give about 280 wrong
+results a minute ([k3skip](https://github.com/jasonmontleon/k3skip)); 5 and 8 give a few; 0, 1, 3, 6, 7 and 10 to 16 gave
+nothing in two minutes. Which counts show wrong results, and how often, changes with the kernel build (6 no-ops: about
+2,000 a minute on the vendor kernel, 900 on 7.3.0, 6 on 7.3.5, 0.1 on 7.3.6, same board; cause not found). The lock-up
+with 4 no-ops does not depend on the kernel: it came within seconds on every kernel tried.
 
-Whether the lock-up also begins with an interrupt is not known.
+## Interrupts
+
+Both forms depend on interrupts arriving. One hart was set aside so that it takes about 3 interrupts a second instead of
+1,000 (`nohz_full`, kernel 7.3.5), and compared with an ordinary hart of the same board:
+
+| Program | Ordinary hart | Hart with about 3 interrupts a second |
+|---|---|---|
+| this program, one worker | locked within 2 s, 5 of 5 runs | 3 of 7 runs locked (within 1 s, 8 s, 27 s); 4 ran to the end (60 s, 60 s, 300 s, 300 s) |
+| wrong results (6 no-ops), 3 runs of 300 s | 30, 26, 60 | 0, 5, 5 |
+
+Before this, the program had never run 300 s on a K3 without locking unless the page was mapped. The locks in the first
+seconds on the set-aside hart may fall into the start of the process, before the kernel has stopped the timer tick for it.
+
+The relation is not a simple proportion: 20 times more timer interrupts on a hart (21,000 a second) did not give more
+wrong results. But together with the traces (an interrupt delivered with a wrong return address) the picture is: after
+this instruction sequence the core is in a state in which taking an interrupt goes wrong; either the return address is
+wrong, or the hart stops.
+
+## What F1 needs
+
+Measured with this version (six workers, 90 s, kernel 7.3.6). Something "removed" is replaced by a no-op of the same
+size, so nothing else moves. F1 makes 29 stores per call: 13 register saves, 2 stack temporaries, 12 integer stores into
+the object, 2 stores of the copies.
+
+| Change in F1 | Result |
+|---|---|
+| any one of its four conditional branches made unconditional or removed | locks (each of the four) |
+| its nine loads of array-element fields removed | locks |
+| two further loads, or the narrow reload of a stack temporary, removed | locks |
+| each floating-point copy done with an integer register instead | locks |
+| three, or five, of its stores sent to unused places in the object | locks |
+| the two stack-temporary stores sent to other slots (no later load overlaps them) | locks |
+| the saves of two registers moved out of the flushed stack line | locks |
+| three early stores, or five late stores, or the four small ones, removed | no lock (3 runs for all twelve together) |
+| the same stores replaced by loads of the same places, or by additions on an unused register | no lock |
+| the saves and restores of two registers removed | no lock |
+| one store added | locks (2 of 2 runs) |
+| three stores added | no lock (2 of 2 runs) |
+
+And with exactly one store removed at a time (one run each): any one of the three early object stores, of the two stack
+temporaries, or of two register saves can go, and it still locks. Of the last eleven stores before the function returns,
+ten cannot: without any single one of them there is no lock.
+
+So F1 does not have to be this function. What it has to do is make stores: about 28 to 30 per call, with a run of about
+ten shortly before it returns. Where they write, whether they are integer or floating-point, and most of what else F1
+does are irrelevant. Loads or arithmetic in their place do not serve. (All of the above concerns the lock-up; "no lock"
+means none in 90 s on six harts, against a lock within 8 s otherwise.)
 
 ## Cautions about the method
 
