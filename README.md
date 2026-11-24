@@ -66,6 +66,8 @@ This version (rv64gc plus Zicbom). "7.3" is a mainline 7.3.5 kernel with board p
 | K3 Pico-ITX | Fedora, 7.3 | `./k3lock` | locked after about 1 s |
 | K3 Pico-ITX | Bianbu | `./k3lock` | locked after 21 s (harts 0 and 6 reported stalled) |
 | Milk-V Titan (not a K3) | 7.3 | `./k3lock` | ran to the end: 86.6 M passes, 0 traps, 0 wrong results |
+| SpacemiT K1 (X60 cores), Milk-V Jupiter | | `./k3lock` | ran to the end: 620 M passes, 0 traps, 0 wrong results |
+| SpacemiT K1 (X60 cores), a second board | | `./k3lock` | ran to the end: 585 M passes, 0 traps, 0 wrong results |
 
 ## What happens when it runs
 
