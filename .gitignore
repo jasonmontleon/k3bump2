@@ -1,5 +1,5 @@
 # build output
 /build/
 /k3lock
-# run output
-k3lock.log*
+# editor swap files
+*.swp

@@ -1,37 +1,59 @@
 /* k3lock: driver for the SpacemiT X100 hart lock-up reproducer.  See README.md.
  *
- * Maps the pages of the "window" (the code one pass executes, at the addresses it had in the original process, plus the few data
- * pages it uses), then loops:  copy the data page of the window's one real function back from a pristine copy NCOPY times,
- * load the starting registers, jump into the window, come back, count.
- * Run:  k3lock             six workers (harts 0,1,3,4,5,6) + two readers (harts 2,7)
- *       k3lock -c 3        one worker on hart 3 + readers on the three other harts of its cluster
- *       ... mapped          control: also map the page behind the straddling branch; must never lock
- * Options: -c LIST  -l LIST|none  -t SECONDS   (see k3main)
+ * Maps the pages of the "window" (window.S: the code one pass executes, at the addresses it had in the original process, plus
+ * the few data pages it uses; data.S), then loops:  load the starting registers, jump into the window, come back, check.
+ * Every worker prints its pass count once a second; a worker whose hart has locked prints nothing more.
+ * On the side the driver checks a value the end of the pass computes (eight instructions that each set one bit: 0xff).
+ * Run:  k3lock             six workers, pinned to harts 0,1,3,4,5,6
+ *       k3lock -c 3        one worker on hart 3
+ *       ... mapped         control: also map the page behind the straddling branch; must never lock
+ * Options: -c LIST (worker harts)   -t SECONDS (default 60)
  * Freestanding: no libc. */
 typedef unsigned long u64;
 #include "build/pages.h"		/* generated: NPAGES, page_table[] */
 extern const unsigned char page_blob[];	/* generated: the contents of those pages (build/pages.bin) */
-struct ctx { u64 regs[32]; u64 t0save; long cnt; u64 exit; u64 fftab; };	/* offsets 256, 264, 272 are used by the exit stub */
+struct ctx { u64 regs[32]; u64 unused[2]; u64 exit; u64 result; };	/* offsets 272 and 280 are used by exit_stub in window.S */
 extern void enter_window(struct ctx *);
 extern void window_exit(void);
 extern long sys6(long nr, long a, long b, long c, long d, long e, long f);
 #define LIB  0x3ff3000000UL
 #define PAGE (LIB + 0x2a20000)			/* the page behind the straddling branch: must have no mapping */
-enum { SYS_openat = 56, SYS_write = 64, SYS_exit_group = 94, SYS_clock_gettime = 113, SYS_sched_setaffinity = 122, SYS_kill = 129,
-       SYS_prctl = 167, SYS_clone = 220, SYS_wait4 = 260, SYS_mmap = 222, SYS_mprotect = 226, SYS_riscv_flush_icache = 259 };
+enum { SYS_write = 64, SYS_exit_group = 94, SYS_clock_gettime = 113, SYS_sched_setaffinity = 122, SYS_sigaltstack = 132,
+       SYS_rt_sigaction = 134, SYS_prctl = 167, SYS_clone = 220, SYS_mmap = 222, SYS_mprotect = 226, SYS_riscv_flush_icache = 259,
+       SYS_wait4 = 260 };
 static struct ctx ctx;
 static const unsigned char zero_page[4096];
 /* registers at the start of every pass; everything else is 0 */
 static const u64 start_regs[32] = {
-	[1]  = LIB + 0x2a9894c,		/* ra: piece_A in window.S, the first instruction of the pass */
-	[2]  = 0x3feb8465b0UL,		/* sp: STACK_TOP in data.S */
+	[1]  = LIB + 0x2a9896c,		/* ra: `start` in window.S, the first instruction of the pass */
+	[2]  = 0x3feb8465b0UL,		/* sp: the stack F1 uses */
+	[4]  = 0x3feb846540UL,		/* tp: the stack line the pass flushes */
 	[18] = 0x3feb8499c0UL,		/* s2: OBJECT in data.S, handed to F1 */
-	[31] = 0x3ff2ee276eUL,		/* t6: the `ret` the driver jumps to (entry_ret in window.S) */
+	[31] = 0x3ff2ee276eUL,		/* t6: the `ret` the driver jumps to (first section of window.S) */
 };
-static unsigned long ncopy;
-static const u64 *pristine[NPAGES];
-static u64 *live[NPAGES];
-static int logfd = -1;
+static void pr(const char *fmt, ...);
+/* --- traps: a worker that gets SIGILL/SIGBUS/SIGSEGV inside the pass reports where, and goes on with the next pass --- */
+static volatile u64 cur_pass, ntraps, nwrong; static long mycpu;
+static volatile int probing;
+static unsigned char altstack[32768];
+static void on_trap(int sig, void *info, void *uc)
+{
+	u64 *r = (u64 *)((char *)uc + 176);		/* ucontext.uc_mcontext: pc, ra, sp, gp, tp, t0, ... */
+	u64 addr = ((u64 *)info)[2];
+	if (probing) { pr("k3lock: this system does not let a user program execute cbo.flush (the core lacks Zicbom, or the kernel does not enable it); cannot run here\n"); sys6(SYS_exit_group, 3, 0, 0, 0, 0, 0); }
+	if (ntraps++ < 12)
+		pr("k3lock: cpu %d: TRAP signal %d at pc 0x%x in pass %d: ra 0x%x sp 0x%x fault address 0x%x\n", (u64)mycpu, (u64)sig, r[0], cur_pass + 1, r[1], r[2], addr);
+	r[0] = (u64)window_exit;			/* resume in the driver as if the pass had returned */
+}
+static void catch_traps(void)
+{
+	struct { void *sp; int flags; u64 size; } ss = { altstack, 0, sizeof(altstack) };
+	struct { void (*fn)(int, void *, void *); u64 flags; u64 mask; } sa = { on_trap, 4 /* SA_SIGINFO */ | 0x08000000 /* SA_ONSTACK */ | 0x40000000 /* SA_NODEFER */, 0 };
+	sys6(SYS_sigaltstack, (long)&ss, 0, 0, 0, 0, 0);
+	sys6(SYS_rt_sigaction, 4 /* SIGILL */, (long)&sa, 0, 8, 0, 0);
+	sys6(SYS_rt_sigaction, 7 /* SIGBUS */, (long)&sa, 0, 8, 0, 0);
+	sys6(SYS_rt_sigaction, 11 /* SIGSEGV */, (long)&sa, 0, 8, 0, 0);
+}
 
 void *memset(void *d, int c, unsigned long n) { unsigned char *p = d; while (n--) *p++ = c; return d; }
 void *memcpy(void *d, const void *s, unsigned long n) { unsigned char *p = d; const unsigned char *q = s; while (n--) *p++ = *q++; return d; }
@@ -49,7 +71,6 @@ static void pr(const char *fmt, ...)		/* %s %d %x only */
 	}
 	__builtin_va_end(ap);
 	sys6(SYS_write, 1, (long)b, n, 0, 0, 0);
-	if (logfd >= 0) sys6(SYS_write, logfd, (long)b, n, 0, 0, 0);
 }
 static void die(const char *s, u64 v) { pr("k3lock: %s 0x%x\n", s, v); sys6(SYS_exit_group, 2, 0, 0, 0, 0, 0); }
 static u64 now_ms(void) { u64 ts[2]; sys6(SYS_clock_gettime, 1, (long)ts, 0, 0, 0, 0); return ts[0] * 1000 + ts[1] / 1000000; }
@@ -66,92 +87,66 @@ static void pin(long cpu)
 	m[cpu / 64] = 1UL << (cpu % 64);
 	if (sys6(SYS_sched_setaffinity, 0, sizeof(m), (long)m, 0, 0, 0) < 0) die("cannot pin to cpu", cpu);
 }
-
 static int in_list(const char *l, long h)		/* is hart h in the comma-separated list? */
 {
 	while (*l) { if (*l >= '0' && *l <= '9' && num(l) == h) return 1; while (*l && *l != ',') l++; if (*l) l++; }
 	return 0;
 }
-static void reader(long h)			/* a neighbour: read a 64 MB buffer in a loop, pinned to hart h */
-{
-	volatile unsigned char *b;
-	sys6(SYS_prctl, 1 /* PR_SET_PDEATHSIG */, 9, 0, 0, 0, 0);
-	pin(h);
-	b = (volatile unsigned char *)sys6(SYS_mmap, 0, 64UL << 20, 3, 0x22 /* PRIVATE|ANONYMOUS */, -1, 0);
-	for (u64 a = 0; a < (64UL << 20); a += 4096) b[a] = 1;
-	for (;;) for (u64 a = 0; a < (64UL << 20); a += 64) (void)b[a];
-}
 static void worker(long cpu, long secs, int control, int many)
 {
-	u64 iter = 0, t0, tnext;
+	u64 pass = 0, t0, tnext;
 
 	if (many) sys6(SYS_prctl, 1 /* PR_SET_PDEATHSIG */, 9, 0, 0, 0, 0);
-	pin(cpu);
-	for (unsigned long i = 0; i < NPAGES; i++) {	/* kind 0: code (this includes the page that ends in half a branch), 1: read-only data, 2: data, 3: data copied back before every pass */
-		u64 a = page_table[i].addr; int k = page_table[i].kind;
-		map_page(a, page_blob + i * 4096, k == 0 ? 5 : k == 1 ? 1 : 3);
-		if (k == 3) { pristine[ncopy] = (const u64 *)(page_blob + i * 4096); live[ncopy++] = (u64 *)a; }
+	pin(cpu); mycpu = cpu; catch_traps();
+	{ static u64 probe_word; probing = 1; __asm__ volatile(".insn i 0x0f, 2, x0, %0, 2" : : "r"(&probe_word)); probing = 0; }	/* cbo.flush once, outside the pass: does this system allow it? */
+	for (unsigned long i = 0; i < NPAGES; i++) {	/* kind 0: code (this includes the page that ends in half a branch), 1: read-only data, 2: data */
+		int k = page_table[i].kind;
+		map_page(page_table[i].addr, page_blob + i * 4096, k == 0 ? 5 : k == 1 ? 1 : 3);
 	}
 	if (control) map_page(PAGE, zero_page, 5);
 	sys6(SYS_riscv_flush_icache, LIB, LIB + 0x338b000, 0, 0, 0, 0);
-	pr("k3lock: cpu %d: %d pages, %d page copies per pass, the page behind the branch is %s\n", (u64)cpu, (u64)NPAGES, ncopy, control ? "MAPPED (control)" : "not mapped");
+	pr("k3lock: cpu %d: %d pages, the page behind the branch is %s\n", (u64)cpu, (u64)NPAGES, control ? "MAPPED (control)" : "not mapped");
 	t0 = now_ms(); tnext = t0 + 1000;
 	for (;;) {
-		for (unsigned long i = 0; i < ncopy; i++) { u64 *d = live[i]; const u64 *s = pristine[i]; for (int j = 0; j < 512; j++) d[j] = s[j]; }
 		for (int i = 0; i < 32; i++) ctx.regs[i] = start_regs[i];
-		ctx.cnt = 1; ctx.exit = (u64)window_exit;
+		ctx.exit = (u64)window_exit; ctx.result = 0; cur_pass = pass;
 		enter_window(&ctx);
-		iter++;
-		if ((iter & 0x3f) == 0 || iter == 1) {
+		pass++;
+		if (ctx.result != 0xff && nwrong++ < 12)
+			pr("k3lock: cpu %d: WRONG RESULT in pass %d: eight instructions each set one bit, expected 0xff, got 0x%x (missing bits 0x%x)\n", (u64)cpu, pass, ctx.result, ctx.result ^ 0xff);
+		if ((pass & 0x3f) == 0 || pass == 1) {
 			u64 t = now_ms();
-			if (t >= tnext || iter == 1) {
-				if (many) pr("k3lock: cpu %d: %d passes, %d s\n", (u64)cpu, iter, (t - t0) / 1000);
-				else pr("k3lock: %d passes, %d s\n", iter, (t - t0) / 1000);
-				tnext = t + 1000;
-			}
+			if (t >= tnext || pass == 1) { pr("k3lock: cpu %d: %d passes, %d s\n", (u64)cpu, pass, (t - t0) / 1000); tnext = t + 1000; }
 			if (t - t0 >= (u64)secs * 1000) break;
 		}
 	}
-	pr("k3lock: cpu %d finished, %d passes in %d s, no hang\n", (u64)cpu, iter, (u64)secs);
+	pr("k3lock: cpu %d finished, %d passes in %d s, no hang\n", (u64)cpu, pass, (u64)secs);
+	pr("k3lock: cpu %d SUMMARY: %d passes, %d traps, %d wrong results\n", (u64)cpu, pass, ntraps, nwrong);
 }
 
-/* no arguments: workers on harts 0,1,3,4,5,6 and readers on harts 2,7 (two per 4-hart cluster share the cache with three workers).
- * -c LIST  worker harts.  With ONE worker the readers default to the three other harts of its cluster.
- * -l LIST  reader harts (`-l none`: no readers).   -t SECONDS (default 60).   mapped: control. */
 void k3main(long argc, char **argv)
 {
-	long secs = 60, control = 0, nw = 0, pids[64], np = 0, one = -1;
-	const char *cpus = "0,1,3,4,5,6", *load = 0;
+	long secs = 60, control = 0, nw = 0, one = -1;
+	const char *cpus = "0,1,3,4,5,6";
 
 	for (long i = 1; i < argc; i++) {
 		if (argv[i][0] == 'm') control = 1;
 		else if (argv[i][0] != '-' || i + 1 >= argc) continue;
 		else if (argv[i][1] == 't') secs = num(argv[++i]);
 		else if (argv[i][1] == 'c') cpus = argv[++i];
-		else if (argv[i][1] == 'l') load = argv[++i];
+		else i++;					/* any other option: skip it and its value */
 	}
 	for (long h = 0; h < 64; h++) if (in_list(cpus, h)) { nw++; one = h; }
 	if (nw == 0) die("no worker hart in the -c list", 0);
-	if (nw == 1) logfd = sys6(SYS_openat, -100, (long)"k3lock.log", 01 | 0100 | 02000 | 04010000 /* O_WRONLY|O_CREAT|O_APPEND|O_SYNC */, 0644, 0, 0);
-	for (long h = 0; h < 64; h++) {				/* the readers */
-		int want = load ? in_list(load, h) : nw == 1 ? (h / 4 == one / 4 && h != one) : (h == 2 || h == 7);
-		if (!want || in_list(cpus, h) || np >= 60) continue;
-		pids[np] = sys6(SYS_clone, 17 /* SIGCHLD */, 0, 0, 0, 0, 0);
-		if (pids[np] == 0) reader(h);
-		pr("k3lock: reader process (pid %d) pinned to cpu %d reads a 64 MB buffer in a loop\n", (u64)pids[np], (u64)h); np++;
-	}
 	if (nw == 1) worker(one, secs, control, 0);
 	else {
-		long nr = np, left = 0;
+		long left = 0;
 		for (long h = 0; h < 64; h++) {
-			if (!in_list(cpus, h) || np >= 64) continue;
-			pids[np] = sys6(SYS_clone, 17, 0, 0, 0, 0, 0);
-			if (pids[np] == 0) { worker(h, secs, control, 1); sys6(SYS_exit_group, 0, 0, 0, 0, 0, 0); }
-			np++; left++;
+			if (!in_list(cpus, h)) continue;
+			if (sys6(SYS_clone, 17 /* SIGCHLD */, 0, 0, 0, 0, 0) == 0) { worker(h, secs, control, 1); sys6(SYS_exit_group, 0, 0, 0, 0, 0, 0); }
+			left++;
 		}
-		while (left-- > 0) sys6(SYS_wait4, -1, 0, 0, 0, 0, 0);		/* a locked worker never exits: then this never returns either */
-		np = nr;
+		while (left-- > 0) sys6(SYS_wait4, -1, 0, 0, 0, 0, 0);
 	}
-	for (long i = 0; i < np; i++) sys6(SYS_kill, pids[i], 9, 0, 0, 0, 0);
 	sys6(SYS_exit_group, 0, 0, 0, 0, 0, 0);
 }

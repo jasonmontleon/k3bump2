@@ -4,7 +4,7 @@ SECTIONS {
   .data2_array     0x3fdc2ed000 : { *(.data2_array) }
   .data2_table     0x3fdc2ee000 : { *(.data2_table) }
   .data2_stack     0x3feb846000 : { *(.data2_stack) }
-  .copy8_object    0x3feb849000 : { *(.copy8_object) }
+  .data2_object    0x3feb849000 : { *(.data2_object) }
   .r_3ff2ee276e    0x3ff2ee276e : { *(.r_3ff2ee276e) }
   .r_199b0         0x3ff30199b0 : { *(.r_199b0) }
   .r_1ffe0         0x3ff301ffe0 : { *(.r_1ffe0) }

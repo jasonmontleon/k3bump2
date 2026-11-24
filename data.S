@@ -1,15 +1,15 @@
 /* The data the window reads.  Everything else in these pages is zero.
  *
- * The window's one real function (F1 in window.S) is handed a pointer to OBJECT.  It reads a cursor from the object, looks up
+ * The window's one real function (F1 in window.S) is called twice per pass.  It is handed a pointer to OBJECT.  It reads a cursor from the object, looks up
  * the 32-byte array element the cursor selects, copies fields of that element and of the object around, and returns.
  * Addresses are the ones these things had in the original process. */
 
-	.section .copy8_object, "aw"		/* page 0x3feb849000: copied back from a pristine copy 8 times before every pass */
+	.section .data2_object, "aw"		/* page 0x3feb849000 */
 	.org 0x9c0
 OBJECT:						/* 0x3feb8499c0 */
 	.org 0x9c0 + 0x98
 	.quad	TABLE				/* +0x98: pointer to the table header */
-	.quad	16				/* +0xa0: cursor = index of the array element to use (the window sets it to 22 before the second call) */
+	.quad	16				/* +0xa0: cursor = index of the array element to use */
 	.quad	0x00000bb400000000, 0, 0x0000000100026d8b	/* +0xa8 .. +0xb8: three words the function copies */
 	.org 0x9c0 + 0x108
 	.quad	0x29d9				/* +0x108: a counter */
@@ -25,9 +25,7 @@ TABLE:						/* 0x3fdc2eed90 */
 	.org 0x500
 ARRAY:						/* 0x3fdc2ed500; elements are 32 bytes */
 	.org 0x500 + 16 * 32
-	.quad	0x0000003800250100, 0x000000000000000b, 0x00026d8d00000000, 0x0000000000000005	/* element 16: read by the first call */
-	.org 0x500 + 22 * 32
-	.quad	0x00000038002f0200, 0x0000000000000df1, 0x00026da500000000, 0x0000000000000004	/* element 22: read by the second call */
+	.quad	0x0000003800250100, 0x000000000000000b, 0x00026d8d00000000, 0x0000000000000005	/* element 16: the one both calls read */
 
 	.section .data2_stack, "aw"		/* page 0x3feb846000: the stack; the window starts with sp = 0x3feb8465b0 */
 	.org 0x5b0

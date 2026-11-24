@@ -74,7 +74,7 @@ enter_window:				/* a0 = struct ctx * */
 	ld	x28, 224(gp)
 	ld	x29, 232(gp)
 	ld	x30, 240(gp)
-	ld	x31, 248(gp)		/* t6 = the `ret` in window.S; ra = piece_A, so that `ret` lands on the pass's first instruction */
+	ld	x31, 248(gp)		/* t6 = the `ret` in window.S; ra = start, so that `ret` lands on the pass's first instruction */
 	jr	x31
 
 	.globl window_exit

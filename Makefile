@@ -2,7 +2,7 @@
 # riscv64 binary with no dependencies: copy it to the target and run it.
 CC      = clang --target=riscv64-linux-gnu
 LD      = ld.lld
-TEXT   ?= 0x200000		# address of the driver's code (ten addresses were tried, all work; this one is the most tested)
+TEXT   ?= 0x200000		# address of the driver's code
 CFLAGS  = -march=rv64gc -mabi=lp64d -mno-relax -O1 -ffreestanding -fno-pic -fno-stack-protector -Wall -Wextra
 LDFLAGS = -nostdlib -static -fuse-ld=lld -Wl,--no-relax -Wl,-z,norelro -Wl,--build-id=none -Wl,-Ttext=$(TEXT)
 
