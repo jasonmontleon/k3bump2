@@ -11,7 +11,7 @@ https://forge.fedoraproject.org/riscv/planning/issues/40.
 This repository contains a small standalone program that causes the same lock-up within seconds, without a compiler, a build
 root or any Fedora files. It was made by recording the last 37,709 instructions the Rust compiler executed on a hart before
 one such lock-up, replaying them in a loop, and then removing everything that could be removed while the lock-up still
-occurred. What is left is a path of about 150 instructions, still at their original addresses, and a few words of data.
+occurred. What is left is a path of about 150 instructions, still at their original addresses. Nothing in it depends on data any more.
 
 What it is for: giving someone who can look inside the core (or its firmware) a short, readable, fast test case. It shows
 WHAT has to be present for the lock-up; it does not explain WHY the core stops.
@@ -69,6 +69,10 @@ This version (rv64gc plus Zicbom). "7.3" is a mainline 7.3.5 kernel with board p
 | SpacemiT M1 (X60 cores, a variant of the K1), Milk-V Jupiter | | `./k3lock` | ran to the end: 620 M passes, 0 traps, 0 wrong results |
 | SpacemiT K1 (X60 cores), Banana Pi BPI-F3 | | `./k3lock` | ran to the end: 585 M passes, 0 traps, 0 wrong results |
 
+The rows above were measured before F1 was replaced by the hand-written one. With the present version, on the K3 CoM260:
+kernel 7.3.6, `./k3lock`: locked within 8 s in 2 of 2 runs; `./k3lock -c 3`: locked within 12 s; `./k3lock -t 120 mapped`:
+ran to the end.
+
 ## What happens when it runs
 
 `./k3lock` starts six worker processes pinned to harts 0, 1, 3, 4, 5, 6. Nothing else is needed; the board can be idle
@@ -100,7 +104,7 @@ On Fedora it is `watchdog: CPUn: Watchdog detected hard LOCKUP on cpu 3`, follow
 | file | what |
 |---|---|
 | `window.S` | The code that triggers the lock-up, in assembly. A hart runs through it once, start to end, and then starts over; this README calls one such run-through a "pass". Each piece of the code is placed at the same memory address it had inside the compiler, because the lock-up depends on those addresses. |
-| `data.S` | The memory contents that code needs: the few data words it reads, and one page of memory that is never executed and ends in the first half of a branch instruction. |
+| `data.S` | The data pages the code uses (an object and a stack, all zeros), and one page of memory that is never executed and ends in the first half of a branch instruction. |
 | `k3lock.c` | The driver, ordinary C. It puts the contents of `window.S` and `data.S` at their addresses, starts the workers, and makes each worker repeat the pass and print how many passes it has done. |
 | `k3lock_asm.S` | A few lines of assembly the driver needs: the program's entry point, the system-call helper, and the jump from the driver into the pass and back. |
 | `build-assets/` | Used only while building; nothing in here runs on the target. `layout.ld` lists the memory address of every piece of `window.S` and `data.S`; `mkpages.py` assembles the two files for those addresses (with `-march=rv64gc`) and packs the result into a table that is compiled into the driver. |
@@ -131,9 +135,12 @@ far_target: jump to exit_stub, which goes back to the driver
 "far call" = `auipc ra, ...` + `jalr ra, ...(ra)`, the two-instruction call compilers emit when the target may be out of
 reach of `jal`. The stubs are PLT-style: `auipc t3; ld t3, ...(t3); jalr t1, t3`.
 
-`F1` is a real function from the compiler (about 95 instructions on the path taken: it saves 13 registers, reads a cursor
-and a 32-byte array element, copies fields around, restores the registers and returns). In the original it copies 16 and 8
-bytes with five vector instructions; here each of those is one floating-point load or store of the same bytes.
+`F1` was a function of the compiler (95 instructions on the path taken). It has been cut down, one tested step at a
+time, to what the failure needs, and is now written by hand: it saves 13 registers, passes a never-taken and a taken
+conditional branch (`bne zero, zero` and `beq zero, zero`), makes five stores, loads 8 bytes from the object and 8 bytes
+from the stack, makes eleven more stores into the object, restores the registers and returns. No-ops stand where the
+removed instructions were, so that each block is still at its original address. What the stores write and what the
+object contains make no difference; `data.S` is all zeros.
 
 `exit_stub` also carries a check that has nothing to do with the lock-up: eight `ori` instructions each set one bit of a
 register, and the driver verifies that the result is 0xff (the "wrong results" count in the summary line). It is what
@@ -251,8 +258,9 @@ wrong, or the hart stops.
 
 ## What F1 needs
 
-Measured with this version (six workers, 90 s, kernel 7.3.6). Something "removed" is replaced by a no-op of the same
-size, so nothing else moves. F1 makes 29 stores per call: 13 register saves, 2 stack temporaries, 12 integer stores into
+Measured with the previous version of this repository, in which F1 was still the compiled function (six workers, 90 s,
+kernel 7.3.6). Something "removed" is replaced by a no-op of the same
+size, so nothing else moves. That F1 made 29 stores per call: 13 register saves, 2 stack temporaries, 12 integer stores into
 the object, 2 stores of the copies.
 
 | Change in F1 | Result |
@@ -274,16 +282,27 @@ And with exactly one store removed at a time (one run each): any one of the thre
 temporaries, or of two register saves can go, and it still locks. Of the last eleven stores before the function returns,
 ten cannot: without any single one of them there is no lock.
 
-So F1 does not have to be this function. What it has to do is make stores: about 28 to 30 per call, with a run of about
+So F1 did not have to be that function. What it has to do is make stores: about 28 to 30 per call, with a run of about
 ten shortly before it returns. Where they write, whether they are integer or floating-point, and most of what else F1
-does are irrelevant. Loads or arithmetic in their place do not serve. (All of the above concerns the lock-up; "no lock"
+did are irrelevant. Loads or arithmetic in their place do not serve. (All of the above concerns the lock-up; "no lock"
 means none in 90 s on six harts, against a lock within 8 s otherwise.)
 
-## Cautions about the method
+The tables above were measured on the compiled F1 that this repository contained until then. From them the hand-written
+F1 now in `window.S` was built in further steps (same conditions, one run each unless noted):
 
-- A single worker process that survives proves little (see above); the tables use six workers of the same variant.
-- "No lock" always means "not in that many passes". Counts are given so the reader can judge.
-- Results were obtained on one K3 CoM260 unless another board is named.
+| Step | Result |
+|---|---|
+| all four conditional branches as plain jumps, nothing else changed | no lock |
+| all four kept as conditional branches on constant conditions (`bne zero, zero`, `beq zero, zero`) | locks |
+| only the first (never taken) kept conditional; only the second (taken) kept | locks; locks |
+| only the third kept; only the fourth kept | no lock; no lock |
+| constant branches, all arithmetic and all loads except the two 8-byte copies' removed | locks |
+| the same, and the two copies done through integer registers | locks |
+| the same, without the two loads of the copies | no lock |
+| **the first two branches conditional, the other two plain jumps (the version in this repository)** | locks: 2 of 2 runs, one worker alone, vendor kernel; no lock with the page mapped |
+| the same with `data.S` reduced to zeros (this repository) | locks: 2 of 2 runs and one worker alone; no lock in 120 s with the page mapped |
+
+So besides its stores F1 needs one conditional branch near its start and its two loads.
 
 ## Unlocking a locked hart with a debugger
 
